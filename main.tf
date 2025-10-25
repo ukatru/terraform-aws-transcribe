@@ -1,0 +1,150 @@
+# IAM role for Lambda execution
+data "aws_iam_policy_document" "lambda_assume_role_policy_doc" {
+  statement {
+    effect = "Allow"
+
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+
+    actions = ["sts:AssumeRole"]
+  }
+}
+
+resource "aws_iam_role" "aws_lambda_iam_role" {
+  name               = "transcribe-service-job-iam-role"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume_role_policy_doc.json
+}
+
+##############################
+# Lambda Layer
+##############################
+
+resource "aws_lambda_layer_version" "python_layer" {
+  filename            = "${path.module}/functions/layers/PythonLayer.zip"
+  layer_name          = "PythonLayer"
+  compatible_runtimes = ["python3.12", "python3.11", "python3.10"]
+  source_code_hash    = filebase64sha256("${path.module}/functions/layers/PythonLayer.zip")
+
+  description = "Python dependencies layer for Transcribe service"
+}
+
+# Lambda function
+resource "aws_lambda_function" "transcribe_service_job" {
+  description = "AWS Lambda function to create Transcribe job"
+  filename = "${path.module}/functions/TranscribeServiceJob.zip"
+  source_code_hash  = filebase64sha256("${path.module}/functions/TranscribeServiceJob.zip")
+  function_name = "TranscribeServiceJob"
+  handler = "TranscribeServiceJob.lambda_handler"
+  runtime = "python3.12"
+  #timeout = 30
+  role = aws_iam_role.aws_lambda_iam_role.arn
+  layers = [aws_lambda_layer_version.python_layer.arn]
+
+  environment {
+    variables = {
+      S3_DESTINATION_BUCKET = aws_s3_bucket.example.id
+    }
+  }
+
+}
+
+# S3 bucket notification configuration
+resource "aws_s3_bucket_notification" "s3_bucket_notification" {
+  bucket = "aws-transcribe-svc-src-001"
+
+  lambda_function {
+    lambda_function_arn = aws_lambda_function.transcribe_service_job.arn
+    events              = ["s3:ObjectCreated:*"]
+    filter_prefix       = "poc/"
+  }
+
+  depends_on = [ aws_lambda_function.transcribe_service_job ]
+}
+
+resource "aws_lambda_permission" "allow_bucket2" {
+  statement_id  = "AllowExecutionFromaws-transcribe-svc-src-001"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.transcribe_service_job.arn
+  principal     = "s3.amazonaws.com"
+  source_arn    = "arn:aws:s3:::aws-transcribe-svc-src-001"
+
+  depends_on = [ aws_lambda_function.transcribe_service_job ]
+}
+
+
+##############################
+# Cloud watch log 
+##############################
+
+resource "aws_cloudwatch_log_group" "transcribe_service_job" {
+  name = "/aws/lambda/${aws_lambda_function.transcribe_service_job.function_name}"
+  retention_in_days = 3
+}
+
+resource "aws_iam_policy" "function_logging_policy" {
+  name   = "function-logging-policy"
+  policy = jsonencode({
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+        "Action": [
+            "logs:CreateLogStream",
+            "logs:PutLogEvents",
+            "logs:DescribeLogGroups",
+            "logs:DescribeLogsStreams"
+        ],
+        "Effect": "Allow",
+        "Resource": "${aws_cloudwatch_log_group.transcribe_service_job.arn}:*"
+    }
+ ]
+})
+}
+
+resource "aws_iam_role_policy_attachment" "function_logging_policy_attachment" {
+  role = aws_iam_role.aws_lambda_iam_role.id
+  policy_arn = aws_iam_policy.function_logging_policy.arn
+}
+
+resource "aws_iam_role_policy_attachment" "transcribe_full_access" {
+  role       = aws_iam_role.aws_lambda_iam_role.id
+  policy_arn = "arn:aws:iam::aws:policy/AmazonTranscribeFullAccess"
+}
+
+resource "aws_iam_policy" "s3_bucket_access_policy" {
+  name        = "transcribe-s3-bucket-access-policy"
+  description = "Policy to allow read access on source bucket and write access on target bucket"
+  
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:ListBucket"
+        ]
+        Resource = [
+          "arn:aws:s3:::aws-transcribe-svc-src-001",
+          "arn:aws:s3:::aws-transcribe-svc-src-001/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:PutObject",
+          "s3:PutObjectAcl"
+        ]
+        Resource = [
+          "arn:aws:s3:::aws-transcribe-svc-tgt-001/*"
+        ]
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "s3_bucket_access_policy_attachment" {
+  role       = aws_iam_role.aws_lambda_iam_role.id
+  policy_arn = aws_iam_policy.s3_bucket_access_policy.arn
+}

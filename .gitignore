@@ -1,0 +1,4 @@
+packages/
+*.terraform
+*.terraform.lock.hcl
+*.terraformrc
